@@ -18,6 +18,7 @@ from abc import ABCMeta, abstractmethod
 from inspect import signature
 
 import numpy as np
+import copy
 from scipy.special import comb
 
 from ..utils import indexable, check_random_state, _safe_indexing
@@ -455,13 +456,19 @@ class GroupKFold(_BaseKFold):
     The same group will not appear in two different folds (the number of
     distinct groups has to be at least equal to the number of folds).
 
-    The folds are approximately balanced in the sense that the number of
-    distinct groups is approximately the same in each fold.
+    The folds are approximately balanced in the sense that the size of each fold
+    is approximately the same.
+
+    Using ``search_max_iter`` it is possible to iterate over splitting permutations to obtain
+    better balancing.
 
     Parameters
     ----------
     n_splits : int, default=5
         Number of folds. Must be at least 2.
+
+    search_max_iter : int, default=1
+        Number of permutations tested in order to optimize the balancing
 
         .. versionchanged:: 0.22
             ``n_splits`` default value changed from 3 to 5.
@@ -499,7 +506,8 @@ class GroupKFold(_BaseKFold):
         For splitting the data according to explicit domain-specific
         stratification of the dataset.
     """
-    def __init__(self, n_splits=5):
+    def __init__(self, n_splits=5, search_max_iter=1):
+        self._search_max_iter = search_max_iter
         super().__init__(n_splits, shuffle=False, random_state=None)
 
     def _iter_test_indices(self, X, y, groups):
@@ -515,6 +523,26 @@ class GroupKFold(_BaseKFold):
                              " than the number of groups: %d."
                              % (self.n_splits, n_groups))
 
+        def merge(groups, bags, best_bags_ref, best_sigma_ref, iter_ref, max_iter):
+            if not groups:
+                sigma = np.std([s[0] for s in bags])
+                iter_ref[0] += 1
+                if best_sigma_ref[0] > sigma:
+                    best_bags_ref[0] = copy.deepcopy(bags)
+                    best_sigma_ref[0] = sigma
+            else:
+                bags = sorted(bags, reverse=True)
+                for i in range(len(groups)):
+                    g = groups.pop(i)
+                    bags[-1][1].append(g)
+                    bags[-1][0] += g
+                    merge(groups, bags, best_bags_ref, best_sigma_ref, iter_ref, max_iter)
+                    if iter_ref[0] >= max_iter and best_bags_ref[0]:
+                        break
+                    groups.insert(i, g)
+                    bags[-1][1].pop()
+                    bags[-1][0] -= g
+
         # Weight groups by their number of occurrences
         n_samples_per_group = np.bincount(groups)
 
@@ -522,17 +550,21 @@ class GroupKFold(_BaseKFold):
         indices = np.argsort(n_samples_per_group)[::-1]
         n_samples_per_group = n_samples_per_group[indices]
 
-        # Total weight of each fold
-        n_samples_per_fold = np.zeros(self.n_splits)
-
         # Mapping from group index to fold index
         group_to_fold = np.zeros(len(unique_groups))
 
-        # Distribute samples by adding the largest weight to the lightest fold
-        for group_index, weight in enumerate(n_samples_per_group):
-            lightest_fold = np.argmin(n_samples_per_fold)
-            n_samples_per_fold[lightest_fold] += weight
-            group_to_fold[indices[group_index]] = lightest_fold
+        bags_ref = [[]]
+        sigma_ref = [np.inf]
+        bags = [[0, []] for _ in range(self.n_splits)]
+        merge(n_samples_per_group.tolist(), bags, bags_ref, sigma_ref, [0], self._search_max_iter)
+        splits = [b[1] for b in bags_ref[0]]
+        for k, bag in enumerate(splits):
+            for s in bag:
+                for i, samples in enumerate(n_samples_per_group):
+                    if samples == s:
+                        n_samples_per_group[i] = 0
+                        group_to_fold[indices[i]] = k
+                        break
 
         indices = group_to_fold[groups]
 
